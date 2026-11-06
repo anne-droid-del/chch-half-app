@@ -7,7 +7,10 @@ import {
   ShieldAlert, 
   Award, 
   TrendingUp,
-  Activity as ActivityIcon
+  Activity as ActivityIcon,
+  Upload,
+  FileText,
+  CheckCircle2
 } from "lucide-react";
 
 const START = "2026-07-06";
@@ -93,6 +96,68 @@ function parseDuration(raw) {
   return p[0] || 0;
 }
 
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+function parseGPX(xmlText) {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(xmlText, "application/xml");
+  const trkpts = Array.from(xml.querySelectorAll("trkpt"));
+  if (!trkpts.length) throw new Error("No track points found in file");
+
+  let totalKm = 0;
+  let hrList = [];
+  let startTime = null;
+  let endTime = null;
+
+  for (let i = 0; i < trkpts.length; i++) {
+    const pt = trkpts[i];
+    const lat = parseFloat(pt.getAttribute("lat"));
+    const lon = parseFloat(pt.getAttribute("lon"));
+    const timeNode = pt.querySelector("time");
+    
+    if (timeNode) {
+      const t = new Date(timeNode.textContent);
+      if (!startTime) startTime = t;
+      endTime = t;
+    }
+
+    if (i > 0) {
+      const prev = trkpts[i - 1];
+      const pLat = parseFloat(prev.getAttribute("lat"));
+      const pLon = parseFloat(prev.getAttribute("lon"));
+      totalKm += haversine(pLat, pLon, lat, lon);
+    }
+
+    const hrNode = pt.querySelector("hr") || pt.querySelector("ns3\\:hr") || pt.querySelector("HeartRateBpm value");
+    if (hrNode) {
+      const hr = parseInt(hrNode.textContent, 10);
+      if (!isNaN(hr) && hr > 40 && hr < 230) hrList.push(hr);
+    }
+  }
+
+  const durationMin = startTime && endTime ? Math.max(1, (endTime - startTime) / 60000) : 0;
+  const avgHr = hrList.length ? Math.round(hrList.reduce((a, b) => a + b, 0) / hrList.length) : undefined;
+  const maxHr = hrList.length ? Math.max(...hrList) : undefined;
+  const runDate = startTime ? iso(startTime) : today();
+
+  return {
+    km: Math.round(totalKm * 100) / 100,
+    min: Math.round(durationMin * 10) / 10,
+    avgHr,
+    maxHr,
+    date: runDate
+  };
+}
+
 function PaceHeartChart({ values, ceiling }) {
   const [selected, setSelected] = useState(null);
   if (!values.length) return <div className="empty-chart">No runs with pace and heart-rate data yet.</div>;
@@ -154,12 +219,9 @@ export default function Home() {
   const [toast, setToast] = useState("");
   const [viewWeek, setViewWeek] = useState(null);
   const [planAdjustments, setPlanAdjustments] = useState({});
-  const [ignoredRunIds, setIgnoredRunIds] = useState([]);
   const [illnessMode, setIllnessMode] = useState(false);
-  const [strava, setStrava] = useState("checking");
-  const [syncing, setSyncing] = useState(false);
-  const [lastSync, setLastSync] = useState(null);
   const [form, setForm] = useState({ date: today(), kind: "easy", km: "", time: "", hr: "", note: "" });
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     try {
@@ -168,7 +230,6 @@ export default function Home() {
       setSettings({ ...DEFAULTS, ...JSON.parse(localStorage.getItem("half-settings") || "{}") });
       const stored = JSON.parse(localStorage.getItem("half-plan-adjustments") || "{}");
       setPlanAdjustments(Object.fromEntries(Object.entries(stored).filter(([, change]) => change > 0)));
-      setIgnoredRunIds(JSON.parse(localStorage.getItem("half-ignored-run-ids") || "[]"));
     } catch {
       setActs(INITIAL_ACTIVITIES);
     }
@@ -178,7 +239,6 @@ export default function Home() {
   useEffect(() => { if (ready) localStorage.setItem("half-activities", JSON.stringify(acts)); }, [acts, ready]);
   useEffect(() => { if (ready) localStorage.setItem("half-settings", JSON.stringify(settings)); }, [settings, ready]);
   useEffect(() => { if (ready) localStorage.setItem("half-plan-adjustments", JSON.stringify(planAdjustments)); }, [planAdjustments, ready]);
-  useEffect(() => { if (ready) localStorage.setItem("half-ignored-run-ids", JSON.stringify(ignoredRunIds)); }, [ignoredRunIds, ready]);
 
   const flash = (s) => { setToast(s); setTimeout(() => setToast(""), 3500); };
   const runs = useMemo(() => acts.filter(a => a.type === "run").sort((a, b) => a.date.localeCompare(b.date)), [acts]);
@@ -216,14 +276,12 @@ export default function Home() {
   const shownPhase = phaseFor(shownWeek);
   const shownSessions = matched.filter(s => s.week === shownWeek);
 
-  const totalKm = runs.reduce((n, a) => n + a.km, 0);
   const easyPaceRuns = runs.filter(a => a.kind !== "hard" && a.avgHr && pace(a));
   const graphRuns = runs.filter(a => a.avgHr && pace(a));
 
   const longestBankedRun = runs.length ? Math.max(...runs.map(r => r.km)) : 8.0;
   const peakProgressPercent = Math.min(100, Math.round((longestBankedRun / PEAK_TARGET_KM) * 100));
 
-  // Aerobic Efficiency Engine (Heart-Rate Adaptation Tracking)
   const efficiencyRuns = easyPaceRuns.filter(a => aerobicEfficiency(a) > 0);
   const efficiencyWindow = Math.min(5, Math.floor(efficiencyRuns.length / 2));
   const efficiencyEarlier = efficiencyWindow >= 2 ? efficiencyRuns.slice(-(efficiencyWindow * 2), -efficiencyWindow) : [];
@@ -233,7 +291,6 @@ export default function Home() {
   const recentScore = meanEfficiency(efficiencyRecent);
   const efficiencyChange = earlierScore ? ((recentScore / earlierScore) - 1) * 100 : null;
 
-  // Head-to-Head Same-HR Pace Comparison
   const latestEasy = easyPaceRuns.at(-1);
   const comparableEasy = latestEasy 
     ? [...easyPaceRuns.slice(0, -1)].reverse().find(a => Math.abs((a.avgHr || 0) - (latestEasy.avgHr || 0)) <= 3) 
@@ -251,30 +308,36 @@ export default function Home() {
     setTab("today");
   }
 
-  async function syncStrava(quiet = false) {
-    if (syncing) return;
-    setSyncing(true);
-    try {
-      const response = await fetch("/api/strava/activities", { cache: "no-store" });
-      if (response.status === 401) { setStrava("disconnected"); return; }
-      if (!response.ok) throw new Error("sync failed");
-      const data = await response.json();
-      setStrava("connected");
-      setLastSync(data.syncedAt || new Date().toISOString());
-      let added = 0;
-      setActs(current => {
-        const ids = new Set(current.map(a => a.id));
-        const fresh = (data.activities || []).filter(a => !ignoredRunIds.includes(a.id) && !ids.has(a.id) && !current.some(x => x.date === a.date && Math.abs(x.km - a.km) < 0.15));
-        added = fresh.length;
-        return fresh.length ? [...current, ...fresh] : current;
-      });
-      if (!quiet) flash(added ? `${added} new Strava runs added.` : "Strava is up to date.");
-    } catch {
-      setStrava("error");
-      if (!quiet) flash("Strava couldn't sync. Your saved runs are still here.");
-    } finally {
-      setSyncing(false);
-    }
+  function handleFileUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const text = event.target.result;
+        const parsed = parseGPX(text);
+        setActs(current => [
+          ...current,
+          {
+            id: `gpx-${Date.now()}`,
+            date: parsed.date,
+            type: "run",
+            kind: parsed.km >= 8 ? "long" : "easy",
+            km: parsed.km,
+            min: parsed.min,
+            avgHr: parsed.avgHr,
+            maxHr: parsed.maxHr,
+            note: `Samsung Health GPX (${parsed.km} km)`
+          }
+        ]);
+        flash(`Banked ${parsed.km} km from Samsung Health!`);
+        setTab("today");
+      } catch (err) {
+        flash("Could not parse file. Make sure it's a valid GPX.");
+      }
+    };
+    reader.readAsText(file);
   }
 
   if (!ready) return <main className="loading">Opening your training log…</main>;
@@ -298,7 +361,6 @@ export default function Home() {
       <section className="content">
         {tab === "today" && (
           <>
-            {/* Safe Mode Banner */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex justify-between items-center text-slate-100 shadow-sm">
               <div className="flex items-center gap-2">
                 <ShieldAlert className={`w-5 h-5 ${illnessMode ? "text-amber-400" : "text-slate-400"}`} />
@@ -317,7 +379,6 @@ export default function Home() {
               />
             </div>
 
-            {/* 22K Over-Distance Peak System Card */}
             <article className="panel adaptive-card progress">
               <div className="adaptive-head">
                 <div>
@@ -345,7 +406,6 @@ export default function Home() {
               </div>
             </article>
 
-            {/* Next Planned Run Card */}
             <article className="next-card">
               <div className="next-head">
                 <span className="pill">Your next run</span>
@@ -374,7 +434,6 @@ export default function Home() {
               <button className="primary" onClick={() => setTab("log")}>Log a run <span>→</span></button>
             </article>
 
-            {/* Aerobic Adaptation Glance Card */}
             {latestEasy && (
               <article className="pace-glance">
                 <div>
@@ -402,7 +461,6 @@ export default function Home() {
               </article>
             )}
 
-            {/* Key Metric Blocks */}
             <div className="stat-grid">
               <article>
                 <span>This week</span>
@@ -421,7 +479,6 @@ export default function Home() {
               </article>
             </div>
 
-            {/* Sessions this week */}
             <article className="week-card">
               <div className="section-title">
                 <div>
@@ -493,31 +550,59 @@ export default function Home() {
         )}
 
         {tab === "log" && (
-          <article className="panel form-panel">
-            <div className="section-title">
-              <div><span>Training Log</span><h2>Record a workout</h2></div>
-            </div>
-            <label>Date<input type="date" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} /></label>
-            <div className="segmented">
-              {["easy", "long", "hard"].map(k => (
-                <button className={form.kind === k ? "active" : ""} onClick={() => setForm({ ...form, kind: k })} key={k}>
-                  {k === "hard" ? "Hard / race" : k}
-                </button>
-              ))}
-            </div>
-            <div className="two">
-              <label>Distance (km)<input inputMode="decimal" placeholder="8.0" value={form.km} onChange={e => setForm({ ...form, km: e.target.value })} /></label>
-              <label>Time<input placeholder="70:00" value={form.time} onChange={e => setForm({ ...form, time: e.target.value })} /></label>
-            </div>
-            <label>Average heart rate (bpm)<input inputMode="numeric" placeholder="150" value={form.hr} onChange={e => setForm({ ...form, hr: e.target.value })} /></label>
-            <label>Notes<input placeholder="Felt relaxed, cadence, weather..." value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} /></label>
-            <button className="primary" onClick={saveRun}>Bank this run <span>✓</span></button>
-          </article>
+          <>
+            <article className="panel" style={{ background: "linear-gradient(145deg, #f0f8f5, #ffffff)", border: "2px dashed #2f8270" }}>
+              <div className="section-title">
+                <div>
+                  <span style={{ color: "#2f8270", fontWeight: "800" }}>Fast Import</span>
+                  <h2>Drop Samsung Health GPX</h2>
+                </div>
+                <Upload className="w-6 h-6 text-teal-700" />
+              </div>
+              <p className="intro" style={{ margin: "8px 0 14px" }}>
+                Export your workout from Samsung Health as a GPX file and tap below. We'll automatically pull the distance, duration, splits, and heart rate.
+              </p>
+              <input 
+                type="file" 
+                accept=".gpx" 
+                ref={fileInputRef} 
+                onChange={handleFileUpload} 
+                style={{ display: "none" }} 
+              />
+              <button 
+                className="primary" 
+                style={{ background: "#2f8270" }}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                Select GPX File from Phone <span>↑</span>
+              </button>
+            </article>
+
+            <article className="panel form-panel">
+              <div className="section-title">
+                <div><span>Manual Log</span><h2>Or enter details manually</h2></div>
+              </div>
+              <label>Date<input type="date" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} /></label>
+              <div className="segmented">
+                {["easy", "long", "hard"].map(k => (
+                  <button className={form.kind === k ? "active" : ""} onClick={() => setForm({ ...form, kind: k })} key={k}>
+                    {k === "hard" ? "Hard / race" : k}
+                  </button>
+                ))}
+              </div>
+              <div className="two">
+                <label>Distance (km)<input inputMode="decimal" placeholder="8.0" value={form.km} onChange={e => setForm({ ...form, km: e.target.value })} /></label>
+                <label>Time<input placeholder="70:00" value={form.time} onChange={e => setForm({ ...form, time: e.target.value })} /></label>
+              </div>
+              <label>Average heart rate (bpm)<input inputMode="numeric" placeholder="150" value={form.hr} onChange={e => setForm({ ...form, hr: e.target.value })} /></label>
+              <label>Notes<input placeholder="Felt relaxed, cadence, weather..." value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} /></label>
+              <button className="primary" onClick={saveRun}>Bank this run <span>✓</span></button>
+            </article>
+          </>
         )}
 
         {tab === "progress" && (
           <>
-            {/* Aerobic Efficiency Overall Score Card */}
             <article className="panel efficiency-card">
               <div className="section-title">
                 <div>
@@ -547,7 +632,6 @@ export default function Home() {
               )}
             </article>
 
-            {/* Dual Line Chart: Pace vs HR */}
             <article className="panel pace-panel">
               <div className="section-title">
                 <div><span>Dual-Curve Tracking</span><h2>Same Effort. Faster Pace.</h2></div>
@@ -561,43 +645,22 @@ export default function Home() {
         )}
 
         {tab === "more" && (
-          <>
-            <article className="panel strava-card">
-              <div className="section-title">
-                <div><span>Automatic Sync</span><h2>Strava Connection</h2></div>
-                <span className={`connection ${strava}`}>{strava === "connected" ? "Connected" : strava === "checking" ? "Checking…" : "Not connected"}</span>
-              </div>
-              {strava === "connected" ? (
-                <>
-                  <p className="intro">Samsung Health sends runs to Strava, and your app updates automatically.</p>
-                  <button className="secondary" onClick={() => syncStrava(false)} disabled={syncing}>{syncing ? "Checking Strava…" : "Sync now"}</button>
-                </>
-              ) : (
-                <>
-                  <p className="intro">Connect your personal Strava account to sync GPS activities and heart rate seamlessly.</p>
-                  <a className="strava-button" href="/api/strava/connect">Connect with Strava</a>
-                </>
-              )}
-            </article>
-
-            <article className="panel">
-              <div className="section-title">
-                <div><span>Custom Thresholds</span><h2>Heart-Rate Parameters</h2></div>
-              </div>
-              <div className="two">
-                <label>Aerobic Ceiling (bpm)
-                  <input inputMode="numeric" value={settings.ceiling} onChange={e => setSettings({ ...settings, ceiling: +e.target.value || settings.ceiling })} />
-                </label>
-                <label>Aerobic Floor (bpm)
-                  <input inputMode="numeric" value={settings.floor} onChange={e => setSettings({ ...settings, floor: +e.target.value || settings.floor })} />
-                </label>
-              </div>
-            </article>
-          </>
+          <article className="panel">
+            <div className="section-title">
+              <div><span>Custom Thresholds</span><h2>Heart-Rate Parameters</h2></div>
+            </div>
+            <div className="two">
+              <label>Aerobic Ceiling (bpm)
+                <input inputMode="numeric" value={settings.ceiling} onChange={e => setSettings({ ...settings, ceiling: +e.target.value || settings.ceiling })} />
+              </label>
+              <label>Aerobic Floor (bpm)
+                <input inputMode="numeric" value={settings.floor} onChange={e => setSettings({ ...settings, floor: +e.target.value || settings.floor })} />
+              </label>
+            </div>
+          </article>
         )}
       </section>
 
-      {/* Global Tab Navigation */}
       <nav className="bottom-nav">
         <button className={tab === "today" ? "active" : ""} onClick={() => setTab("today")}>
           <span>📅</span>Today
@@ -612,7 +675,7 @@ export default function Home() {
           <span>📈</span>Progress
         </button>
         <button className={tab === "more" ? "active" : ""} onClick={() => setTab("more")}>
-          <span>⚙️</span>More
+          <span>⚙️</span>Settings
         </button>
       </nav>
 
